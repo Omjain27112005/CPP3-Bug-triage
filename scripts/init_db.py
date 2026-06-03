@@ -11,7 +11,10 @@ load_dotenv()
 
 from orchestrator.db.base import Base
 from orchestrator.db.session import engine, AsyncSessionLocal
-from orchestrator.db.models import SourceRegistry, CMDBTeamRegistry, SLAConfig, UserRole, CustomerCase
+from orchestrator.db.models import (
+    Base, SourceRegistry, CMDBTeamRegistry, SLAConfig, UserRole, CustomerCase,
+    SystemGroupRegistry, BugGroupMapping
+)
 from sqlalchemy import select
 
 DEMO_SOURCES = [

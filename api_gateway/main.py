@@ -1,3 +1,4 @@
+import asyncio
 import re
 import time
 import uuid
@@ -11,10 +12,105 @@ from .routes import auth_router, cases_router, triage_router, settings_router
 log = structlog.get_logger()
 
 
+async def start_kafka_consumer():
+    try:
+        from orchestrator.kafka_consumer import consume_triage_requests
+        await consume_triage_requests()
+    except Exception as e:
+        log.warning("kafka_consumer_failed", error=str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with kafka_lifespan(app):
+        consumer_task = asyncio.create_task(start_kafka_consumer())
+        app.state.consumer_task = consumer_task
+        log.info("gateway_ready", host="0.0.0.0", port=8000)
+
+        # Start background bug list pre-fetcher
+        async def background_ingestion():
+            while True:
+                try:
+                    await asyncio.sleep(600)  # Run every 10 minutes
+                    from orchestrator.connectors.registry import ConnectorRegistry
+                    from orchestrator.redis_client import cache_buglist
+                    import dataclasses
+
+                    ConnectorRegistry.invalidate_cache()
+                    connectors = await ConnectorRegistry.get_all_enabled()
+                    excluded = {"confluence", "customer_portal"}
+
+                    for connector in connectors:
+                        if connector.system_type in excluded:
+                            continue
+                        try:
+                            connector_class = type(connector).__name__.lower()
+                            tickets = []
+
+                            if "jira" in connector_class:
+                                for start_at in [0, 100, 200]:
+                                    batch = await asyncio.wait_for(
+                                        connector.search("", max_results=100,
+                                                         start_at=start_at),
+                                        timeout=20.0
+                                    )
+                                    if not batch:
+                                        break
+                                    tickets.extend(batch)
+                                    if len(batch) < 100:
+                                        break
+
+                            elif "github" in connector_class:
+                                for page in [1, 2, 3]:
+                                    batch = await asyncio.wait_for(
+                                        connector.search("", max_results=100,
+                                                         page=page),
+                                        timeout=15.0
+                                    )
+                                    if not batch:
+                                        break
+                                    tickets.extend(batch)
+                                    if len(batch) < 100:
+                                        break
+
+                            elif "bugzilla" in connector_class:
+                                tickets = await asyncio.wait_for(
+                                    connector.search("", max_results=300),
+                                    timeout=20.0
+                                )
+
+                            if tickets:
+                                data = [dataclasses.asdict(t) for t in tickets]
+                                await cache_buglist(
+                                    connector.source_id, "open", "", data,
+                                    ttl=700
+                                )
+                                log.info(
+                                    f"[Ingestion] {connector.source_id}: "
+                                    f"{len(data)} bugs refreshed"
+                                )
+
+                        except Exception as e:
+                            log.warning(
+                                f"[Ingestion] {connector.source_id} failed: {e}"
+                            )
+
+                except Exception as e:
+                    log.warning(f"[Ingestion] cycle failed: {e}")
+
+        ingestion_task = asyncio.create_task(background_ingestion())
+        app.state.ingestion_task = ingestion_task
         yield
+    consumer_task.cancel()
+    try:
+        await consumer_task
+    except asyncio.CancelledError:
+        pass
+    ingestion_task.cancel()
+    try:
+        await ingestion_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(

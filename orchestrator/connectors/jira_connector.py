@@ -128,32 +128,136 @@ class JiraConnector(BaseConnector):
             return None
 
     async def search(self, query: str, max_results: int = 100, start_at: int = 0) -> list[TicketData]:
+        fields = ["summary", "description", "status", "priority", "components",
+                  "assignee", "reporter", "created", "updated", "comment", "issuelinks"]
         if query:
             jql = f'project = {self.project_key} AND text ~ "{query}" ORDER BY updated DESC'
         else:
-            jql = f"project = {self.project_key} AND status in (Open, Reopened, 'In Progress') ORDER BY updated DESC"
+            jql = f'project = {self.project_key} AND statusCategory in ("To Do", "In Progress") ORDER BY updated DESC'
 
-        payload = {"jql": jql, "maxResults": max_results, "startAt": start_at,
-                   "fields": ["summary", "description", "status", "priority", "components",
-                              "assignee", "reporter", "created", "updated", "comment", "issuelinks"]}
+        payload = {
+            "jql": jql,
+            "maxResults": min(max_results, 100),
+            "startAt": start_at,
+            "fields": fields,
+        }
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=22) as client:
                 resp = await client.post(
                     f"{self.base_url}/rest/api/2/search",
                     json=payload, headers=self._headers()
                 )
-                if resp.status_code != 200:
-                    return []
-                data = resp.json()
-                return [self._normalise(issue) for issue in data.get("issues", [])]
+                resp.raise_for_status()
+                issues = resp.json().get("issues") or []
+                return [self._normalise(issue) for issue in issues if isinstance(issue, dict)]
         except Exception:
             return []
+
+    async def get_lightweight(self, ticket_id: str) -> dict:
+        url = f"{self.base_url}/rest/api/2/issue/{ticket_id}"
+        params = {"fields": "updated,priority,status"}
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(url, headers=self._headers(), params=params)
+                if resp.status_code != 200:
+                    return {}
+                fields = resp.json().get("fields", {})
+                priority_name = ((fields.get("priority") or {}).get("name") or "").lower()
+                severity = JIRA_PRIORITY_MAP.get(priority_name, "Unknown")
+                raw_status = ((fields.get("status") or {}).get("name") or "").lower()
+                status = JIRA_STATUS_MAP.get(raw_status, raw_status.title())
+                return {"updated_at": fields.get("updated", ""), "severity": severity, "status": status}
+        except Exception:
+            return {}
 
     async def get_linked_items(self, ticket_id: str) -> list[dict]:
         ticket = await self.get(ticket_id)
         if ticket:
             return ticket.linked_items
         return []
+
+    def extract_links(self, raw_payload: dict) -> list[dict]:
+        links = []
+        fields = raw_payload.get("fields") or {}
+
+        # 1. Direct issue-to-issue links (JIRA issuelinks block)
+        for link in (fields.get("issuelinks") or []):
+            sub = link.get("outwardIssue") or link.get("inwardIssue")
+            if sub:
+                links.append({
+                    "raw_id": sub.get("key", ""),
+                    "source": "JIRA",
+                    "relationship": (
+                        (link.get("type") or {}).get("name",
+                                                      "referenced")),
+                })
+
+        # 2. Remote web links — GitHub PRs and external trackers
+        for rlink in (fields.get("remotelinks") or []):
+            url = ((rlink.get("object") or {}).get("url") or "")
+            if not url:
+                continue
+            # GitHub PR pattern
+            if "github.com" in url and "/pull/" in url:
+                try:
+                    pr_id = url.rstrip("/").split("/")[-1]
+                    if pr_id.isdigit():
+                        links.append({
+                            "raw_id": pr_id,
+                            "source": "GitHub",
+                            "relationship": "Pull Request",
+                            "url": url,
+                        })
+                except Exception:
+                    pass
+            # GitHub issue pattern
+            elif "github.com" in url and "/issues/" in url:
+                try:
+                    issue_id = url.rstrip("/").split("/")[-1]
+                    if issue_id.isdigit():
+                        links.append({
+                            "raw_id": issue_id,
+                            "source": "GitHub",
+                            "relationship": "Issue Reference",
+                            "url": url,
+                        })
+                except Exception:
+                    pass
+            # Bugzilla pattern
+            elif "bugzilla" in url and "id=" in url:
+                try:
+                    bz_id = url.split("id=")[-1].split("&")[0]
+                    if bz_id.isdigit():
+                        links.append({
+                            "raw_id": bz_id,
+                            "source": "Bugzilla",
+                            "relationship": "See Also",
+                            "url": url,
+                        })
+                except Exception:
+                    pass
+
+        # 3. Scan description text for JIRA ticket IDs
+        desc = str(fields.get("description") or "")
+        import re
+        for match in re.finditer(
+                r'\b([A-Z]{2,10}-\d{3,6})\b', desc):
+            raw_id = match.group(1)
+            if raw_id != raw_payload.get("key", ""):
+                links.append({
+                    "raw_id": raw_id,
+                    "source": "JIRA",
+                    "relationship": "Mentioned",
+                })
+
+        # Deduplicate by raw_id
+        seen = set()
+        unique = []
+        for l in links:
+            if l["raw_id"] not in seen:
+                seen.add(l["raw_id"])
+                unique.append(l)
+        return unique
 
     async def get_changelog(self, ticket_id: str, since: str = "") -> list[ChangeEvent]:
         url = f"{self.base_url}/rest/api/2/issue/{ticket_id}/changelog"

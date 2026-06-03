@@ -5,6 +5,11 @@ from groq import AsyncGroq
 from pydantic import ValidationError
 from .base import BaseAgent
 from ..models.synthesis import SynthesisOutput
+from ..db.session import AsyncSessionLocal
+from ..db.repositories.group_registry import (
+    get_next_group_id, create_group,
+    get_group_for_any_ticket, add_tickets_to_group
+)
 
 log = structlog.get_logger()
 
@@ -62,14 +67,49 @@ class AISynthesisAgent(BaseAgent):
             except (ValidationError, json.JSONDecodeError, Exception) as e:
                 log.warning("Synthesis attempt failed", attempt=attempt, error=str(e))
 
+        # If both attempts failed, try JSON repair with fast model
+        if synthesis is None and groq_api_key:
+            try:
+                repair_client = AsyncGroq(api_key=groq_api_key)
+                repair_prompt = (
+                    f"The following text should be valid JSON matching "
+                    f"this schema:\n{SYNTHESIS_SCHEMA}\n\n"
+                    f"Fix any syntax errors and return only valid JSON:\n"
+                    f"{prompt[:500]}"
+                )
+                repair_resp = await repair_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": repair_prompt}],
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    max_tokens=512,
+                )
+                raw = repair_resp.choices[0].message.content or "{}"
+                data = json.loads(raw)
+                synthesis = SynthesisOutput(**data)
+                log.info("Synthesis repaired with fast model")
+            except Exception as e:
+                log.warning("Synthesis repair also failed", error=str(e))
+
         if synthesis is None:
             synthesis = self._keyword_fallback(primary)
 
         context["synthesis"] = synthesis.model_dump()
-        print(f"[AISynthesis] Complete. Severity: {synthesis.unified_severity}, Confidence: {synthesis.confidence}", flush=True)
+
+        # BT-xxx System ID Resolution Block
+        group_id = await self._resolve_group_id(
+            context, synthesis)
+        if group_id:
+            context["group_id"] = group_id
+            context["synthesis"]["group_id"] = group_id
+            log.info("BT group resolved",
+                     case_id=context.get("case_id"),
+                     group_id=group_id)
+
         return context
 
-    def _build_prompt(self, primary: dict, related: list, kb_articles: list, customer_cases: list) -> str:
+    def _build_prompt(self, primary: dict, related: list,
+                      kb_articles: list, customer_cases: list = None) -> str:
         related_str = ""
         for r in related[:5]:
             related_str += f"- [{r.get('source_id','')}] {r.get('ticket_id','')} — {r.get('title','')} (score: {r.get('similarity_score', 0):.2f}, reason: {r.get('similarity_reason','')})\n"
@@ -77,6 +117,15 @@ class AISynthesisAgent(BaseAgent):
         kb_str = ""
         for kb in kb_articles[:3]:
             kb_str += f"- {kb.get('title','')} ({kb.get('relevance','')}) — {kb.get('excerpt','')[:100]}\n"
+
+        customer_str = ""
+        for cc in (customer_cases or [])[:3]:
+            customer_str += (
+                f"- [{cc.get('case_id','')}] {cc.get('customer','')} — "
+                f"{cc.get('title','')} "
+                f"(severity: {cc.get('severity','')}, "
+                f"impact: {cc.get('impact','')[:80]})\n"
+            )
 
         return f"""You are an expert software bug triage system. Analyze the following bug and produce a comprehensive triage report.
 
@@ -96,6 +145,9 @@ RELATED ISSUES FOUND:
 KNOWLEDGE BASE ARTICLES:
 {kb_str or "None found"}
 
+CUSTOMER CASES REPORTING THIS BUG:
+{customer_str or "None reported"}
+
 Respond with a JSON object matching this schema exactly:
 {SYNTHESIS_SCHEMA}
 
@@ -105,6 +157,56 @@ Guidelines:
 - engineer_summary: technical details for the engineer
 - customer_summary: non-technical explanation for the customer
 - recommended_actions: 3-5 specific actionable steps"""
+
+    async def _resolve_group_id(self, context: dict,
+                                 synthesis) -> str | None:
+        primary = context.get("primary_ticket") or {}
+        related = context.get("related_tickets") or []
+
+        primary_ticket_ref = {
+            "ticket_id": primary.get("ticket_id", ""),
+            "source_id": primary.get("source_id",
+                                      context.get("source_id", "")),
+            "system_type": primary.get("system_type", ""),
+        }
+
+        all_tickets = [primary_ticket_ref] + [
+            {
+                "ticket_id": t.get("ticket_id", ""),
+                "source_id": t.get("source_id", ""),
+                "system_type": t.get("system_type", ""),
+            }
+            for t in related
+            if t.get("similarity_score", 0) >= 0.50
+        ]
+
+        try:
+            async with AsyncSessionLocal() as db:
+                # Scenario A: join existing group
+                existing = await get_group_for_any_ticket(
+                    db, all_tickets)
+                if existing:
+                    await add_tickets_to_group(
+                        db, existing, all_tickets)
+                    return existing
+
+                # Scenario B: mint new group
+                new_id = await get_next_group_id(db)
+                priority = getattr(synthesis,
+                                    "unified_severity", "P2")
+                title = primary.get("title", "Bug Group")[:300]
+                src = primary.get(
+                    "source_id", context.get("source_id", ""))
+                await create_group(db, new_id, title,
+                                   priority, src)
+                await add_tickets_to_group(
+                    db, new_id, all_tickets)
+                return new_id
+
+        except Exception as e:
+            log.warning("BT group resolution failed",
+                        error=str(e))
+            return None
 
     def _keyword_fallback(self, primary: dict) -> SynthesisOutput:
         severity = primary.get("severity", "P2")

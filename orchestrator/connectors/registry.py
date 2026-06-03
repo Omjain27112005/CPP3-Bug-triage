@@ -12,7 +12,9 @@ log = structlog.get_logger()
 
 SYSTEM_TYPE_TO_CLASS = {
     "github":          GithubConnector,
+    "jira":            JiraConnector,
     "jira_apache":     JiraConnector,
+    "jira_cloud":      JiraConnector,
     "bugzilla":        BugzillaConnector,
     "confluence":      ConfluenceConnector,
     "customer_portal": CustomerPortalConnector,

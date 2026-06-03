@@ -72,7 +72,8 @@ async def start_triage(
     if producer:
         published = await publish_triage_request(producer, case_id, bug_id, source_id, user.user_id)
 
-    if not published and ENABLE_LOCAL_PIPELINE_FALLBACK:
+    # Always run locally when fallback is enabled — belt and suspenders
+    if ENABLE_LOCAL_PIPELINE_FALLBACK:
         from orchestrator.orchestrator import TaskOrchestrator
         orch = TaskOrchestrator()
         asyncio.create_task(orch.run(case_id, bug_id, source_id, user.user_id))
@@ -82,10 +83,42 @@ async def start_triage(
 
 @router.get("/triage/{case_id}/result")
 async def get_triage_result(case_id: str, user: User = Depends(get_current_user)):
+    # First try Redis cache (fast path)
     cached = await get_cached_case_result(case_id)
-    if not cached:
-        raise HTTPException(status_code=404, detail="Result not found or expired")
-    return cached
+    if cached:
+        return cached
+
+    # Fallback: reconstruct from audit_log when cache has expired
+    try:
+        from orchestrator.db.repositories.audit_log import get_last_triage_by_case_id
+        async with AsyncSessionLocal() as db:
+            entry = await get_last_triage_by_case_id(db, case_id)
+        if entry:
+            summary = entry.summary or {}
+            return {
+                "case_id": case_id,
+                "bug_id": entry.bug_id,
+                "source_id": entry.source_id,
+                "from_cache": False,
+                "context": {
+                    "synthesis": {
+                        "unified_severity": summary.get("severity"),
+                        "confidence": summary.get("confidence"),
+                        "root_cause": summary.get("root_cause", ""),
+                        "recommended_actions": summary.get("recommended_actions", []),
+                        "engineer_summary": summary.get("engineer_summary", ""),
+                        "status_summary": summary.get("status_summary", ""),
+                        "used_fallback": summary.get("used_fallback", False),
+                    },
+                    "related_tickets": [],
+                    "kb_articles": [],
+                    "customer_cases": [],
+                },
+            }
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=404, detail="Result not found or expired. Please retriage.")
 
 
 @router.websocket("/triage/{case_id}/stream")

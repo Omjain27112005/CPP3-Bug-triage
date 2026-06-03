@@ -27,3 +27,16 @@ class BaseConnector(ABC):
     @abstractmethod
     async def get_changelog(self, ticket_id: str, since: str = "") -> list[ChangeEvent]:
         pass
+
+    @abstractmethod
+    async def get_lightweight(self, ticket_id: str) -> dict:
+        """Fetch only updated_at, severity, status. Returns {} on failure."""
+
+    @abstractmethod
+    def extract_links(self, raw_payload: dict) -> list[dict]:
+        """
+        Parse raw API payload and return explicit outbound references.
+        Each reference is a dict with keys:
+          raw_id, source, relationship, url (optional)
+        Returns empty list if not supported.
+        """

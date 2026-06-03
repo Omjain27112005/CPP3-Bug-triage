@@ -81,27 +81,35 @@ class BugzillaConnector(BaseConnector):
         except Exception:
             return None
 
-    async def search(self, query: str, max_results: int = 500, offset: int = 0) -> list[TicketData]:
-        params = {
-            "product": self.project_key,
-            "status": ["UNCONFIRMED", "NEW", "ASSIGNED", "IN_PROGRESS", "REOPENED"],
-            "limit": max_results,
-            "offset": offset,
-            "order": "changeddate DESC",
-            "include_fields": ["id", "summary", "status", "priority", "component",
-                               "assigned_to", "creator", "creation_time", "last_change_time", "see_also"],
-        }
-        if query:
-            params["quicksearch"] = query
-            del params["status"]
-
+    async def search(self, query: str, max_results: int = 300) -> list[TicketData]:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(f"{self.base_url}/rest/bug", headers=self._headers(), params=params)
-                if resp.status_code != 200:
-                    return []
-                return [self._normalise(b) for b in resp.json().get("bugs", [])]
-        except Exception:
+            async with httpx.AsyncClient(timeout=20) as client:
+                if not query:
+                    url = f"{self.base_url}/rest/bug"
+                    params = [
+                        ("product", self.project_key),
+                        ("status", "UNCONFIRMED"),
+                        ("status", "NEW"),
+                        ("status", "ASSIGNED"),
+                        ("status", "REOPENED"),
+                        ("limit", str(max_results)),
+                        ("order", "changeddate DESC"),
+                        ("include_fields", "id,summary,status,priority,severity,component,assigned_to,creator,creation_time,last_change_time,see_also"),
+                    ]
+                else:
+                    url = f"{self.base_url}/rest/bug"
+                    params = [
+                        ("product", self.project_key),
+                        ("quicksearch", query),
+                        ("limit", str(max_results)),
+                        ("include_fields", "id,summary,status,priority,severity,component,assigned_to,creator,creation_time,last_change_time,see_also"),
+                    ]
+                resp = await client.get(url, headers=self._headers(), params=params)
+                resp.raise_for_status()
+                bugs = resp.json().get("bugs") or []
+                return [self._normalise(bug) for bug in bugs if isinstance(bug, dict)]
+        except Exception as e:
+            print(f"[Bugzilla] search failed: {e}")
             return []
 
     async def get_linked_items(self, ticket_id: str) -> list[dict]:
@@ -109,6 +117,78 @@ class BugzillaConnector(BaseConnector):
         if ticket:
             return ticket.linked_items
         return []
+
+    async def get_lightweight(self, ticket_id: str) -> dict:
+        url = f"{self.base_url}/rest/bug/{ticket_id}"
+        params = {"include_fields": "last_change_time,priority,status"}
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(url, headers=self._headers(), params=params)
+                if resp.status_code != 200:
+                    return {}
+                bugs = resp.json().get("bugs", [])
+                if not bugs:
+                    return {}
+                b = bugs[0]
+                return {
+                    "updated_at": b.get("last_change_time", ""),
+                    "severity": "Unknown",
+                    "status": b.get("status", ""),
+                }
+        except Exception:
+            return {}
+
+    def extract_links(self, raw_payload: dict) -> list[dict]:
+        import re
+        links = []
+        bugs = raw_payload.get("bugs") or []
+        if not bugs:
+            return []
+        bug = bugs[0]
+
+        # 1. depends_on and blocks — direct Bugzilla dependencies
+        for dep_id in (bug.get("depends_on") or []):
+            links.append({
+                "raw_id": str(dep_id),
+                "source": "Bugzilla",
+                "relationship": "Depends On",
+            })
+        for block_id in (bug.get("blocks") or []):
+            links.append({
+                "raw_id": str(block_id),
+                "source": "Bugzilla",
+                "relationship": "Blocks",
+            })
+
+        # 2. see_also — external URLs
+        for url in (bug.get("see_also") or []):
+            if "issues.apache.org" in url or "jira." in url:
+                m = re.search(r'/browse/([A-Z]{2,10}-\d+)', url)
+                if m:
+                    links.append({
+                        "raw_id": m.group(1),
+                        "source": "JIRA",
+                        "relationship": "See Also",
+                        "url": url,
+                    })
+            elif "github.com" in url and "/issues/" in url:
+                issue_id = url.rstrip("/").split("/")[-1]
+                if issue_id.isdigit():
+                    links.append({
+                        "raw_id": issue_id,
+                        "source": "GitHub",
+                        "relationship": "See Also",
+                        "url": url,
+                    })
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for l in links:
+            if l["raw_id"] not in seen:
+                seen.add(l["raw_id"])
+                unique.append(l)
+        return unique
 
     async def get_changelog(self, ticket_id: str, since: str = "") -> list[ChangeEvent]:
         url = f"{self.base_url}/rest/bug/{ticket_id}/history"

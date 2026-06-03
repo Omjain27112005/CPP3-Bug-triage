@@ -32,6 +32,16 @@ async def get_metrics_summary(db: AsyncSession) -> dict:
     }
 
 
+async def get_last_triage_by_case_id(db: AsyncSession, case_id: str) -> AuditLog | None:
+    result = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.case_id == case_id)
+        .order_by(desc(AuditLog.created_at))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def list_recent_pipeline_completions(db: AsyncSession, limit: int = 50) -> list[AuditLog]:
     result = await db.execute(
         select(AuditLog)

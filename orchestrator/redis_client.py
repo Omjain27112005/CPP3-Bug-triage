@@ -61,21 +61,40 @@ async def publish_panel_update(case_id: str, panel_name: str, data: dict) -> Non
         r = await get_redis()
         message = json.dumps({"panel": panel_name, "data": data})
 
-        # Store as persistent key so late-connecting WebSocket can replay
-        panel_key = f"panel:{case_id}:{panel_name}"
-        await r.setex(panel_key, 3600, message)
+        # Persist panel so late-connecting WebSockets can replay it
+        await r.setex(f"panel:{case_id}:{panel_name}", 3600, message)
 
-        # Ordered list of panels received so far
-        panels_key = f"panels:{case_id}"
-        await r.rpush(panels_key, panel_name)
-        await r.expire(panels_key, 3600)
+        # Track order of panels for this case
+        await r.rpush(f"panels:{case_id}", panel_name)
+        await r.expire(f"panels:{case_id}", 3600)
 
-        # Publish for live listeners
+        # Publish to live listeners
         await r.publish(f"ws:{case_id}", message)
 
-        log.info("Panel published", case_id=case_id, panel=panel_name)
+        log.info("Panel published",
+            case_id=case_id, panel=panel_name)
+
     except Exception as e:
         log.warning("publish_panel_update failed", error=str(e))
+
+
+async def store_pipeline_complete(case_id: str, severity: str,
+                                   confidence: float,
+                                   duration_ms: int) -> None:
+    try:
+        r = await get_redis()
+        message = json.dumps({
+            "type": "pipeline_complete",
+            "case_id": case_id,
+            "severity": severity,
+            "confidence": confidence,
+            "duration_ms": duration_ms,
+        })
+        await r.setex(f"panel:{case_id}:pipeline_complete", 3600, message)
+        await r.rpush(f"panels:{case_id}", "pipeline_complete")
+        await r.expire(f"panels:{case_id}", 3600)
+    except Exception as e:
+        log.warning("store_pipeline_complete failed", error=str(e))
 
 
 async def get_stored_panels(case_id: str) -> list[dict]:

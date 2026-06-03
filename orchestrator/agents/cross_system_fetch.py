@@ -1,11 +1,12 @@
 import asyncio
-import json
-import os
 import dataclasses
+import os
+import json
 import structlog
 from groq import AsyncGroq
 from .base import BaseAgent
-from orchestrator.connectors.registry import ConnectorRegistry
+from ..connectors.registry import ConnectorRegistry
+from ..models.synthesis import CandidateScore
 
 log = structlog.get_logger()
 
@@ -14,267 +15,402 @@ class CrossSystemFetchAgent(BaseAgent):
     step_name = "cross_system_fetch"
 
     async def run(self, context: dict) -> dict:
-        primary_ticket = context.get("primary_ticket")
-        source_id = context.get("source_id", "")
-        keywords = context.get("keywords", [])
+        primary = context.get("primary_ticket") or {}
+        primary_source = context.get("source_id", "")
 
-        if not primary_ticket:
-            print("[CrossSystemFetch] No primary ticket in context", flush=True)
+        if not primary:
+            self._add_error(context, "No primary ticket in context")
             context["related_tickets"] = []
             context["sources_queried"] = []
             return context
 
-        groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY", ""))
-        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        groq_api_key = os.getenv("GROQ_API_KEY", "")
+        groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-        # Step A: LLM generates optimal search query
-        search_query = await self._generate_query(groq_client, model, primary_ticket, keywords)
-        print(f"[CrossSystemFetch] Query: '{search_query}'", flush=True)
+        # Step A: Generate platform-specific queries using LLM
+        query_map = await self._generate_platform_queries(
+            primary, groq_api_key, groq_model
+        )
+        log.info("CrossSystem queries generated", queries=query_map)
 
-        # Step B: Search other bug-tracker connectors in parallel
+        # Step B: Select target connectors
         all_connectors = await ConnectorRegistry.get_all_enabled()
-        other_connectors = [
-            c for c in all_connectors
-            if c.source_id != source_id
-            and c.system_type not in ("confluence", "customer_portal")
-        ]
+        targets = self._select_targets(all_connectors, primary_source)
+        log.info("CrossSystem targets", targets=[c.source_id for c in targets])
 
-        # Prioritize connectors by relevance to source project
-        source_project = ""
-        for c in all_connectors:
-            if c.source_id == source_id:
-                source_project = c.project_key or ""
-                break
-
-        def connector_priority(c):
-            project = (c.project_key or "").lower()
-            src_proj = source_project.lower()
-            org_word = src_proj.split("/")[0] if "/" in src_proj else src_proj.split("-")[0]
-            if org_word and org_word in project:
-                return 0   # Same org — highest priority
-            if c.system_type == "jira_apache":
-                return 1   # JIRA always valuable for cross-system
-            if c.system_type == "bugzilla":
-                return 2
-            return 3       # Other GitHub repos — lowest priority
-
-        other_connectors.sort(key=connector_priority)
-        other_connectors = other_connectors[:5]  # Limit to 5 most relevant
-
-        print(f"[CrossSystemFetch] Searching {len(other_connectors)} connectors: {[c.source_id for c in other_connectors]}", flush=True)
-
-        if not other_connectors:
+        if not targets:
+            log.warning("No target connectors", primary_source=primary_source)
             context["related_tickets"] = []
             context["sources_queried"] = []
             return context
 
-        sources_queried = [c.source_id for c in other_connectors]
+        # Step C: Fire parallel searches with platform-specific queries
+        async def search_one(connector):
+            connector_class = type(connector).__name__.lower()
+            if "jira" in connector_class:
+                query = query_map.get("jira_query", "")
+            elif "github" in connector_class:
+                query = query_map.get("github_query", "")
+            elif "bugzilla" in connector_class:
+                query = query_map.get("bugzilla_query", "")
+            else:
+                query = query_map.get("github_query", "")
 
-        async def safe_search(connector):
+            if not query:
+                return connector.source_id, []
+
             try:
                 results = await asyncio.wait_for(
-                    connector.search(search_query, max_results=5),
-                    timeout=12.0,
+                    connector.search(query, max_results=8),
+                    timeout=12.0
                 )
-                print(f"[CrossSystemFetch] {connector.source_id}: {len(results or [])} results", flush=True)
-                return results or []
+                log.info("CrossSystem result",
+                    source=connector.source_id,
+                    query=query,
+                    count=len(results)
+                )
+                return connector.source_id, results
             except asyncio.TimeoutError:
-                print(f"[CrossSystemFetch] {connector.source_id}: TIMEOUT", flush=True)
-                return []
+                log.warning("CrossSystem timeout", source=connector.source_id)
+                return connector.source_id, []
             except Exception as e:
-                print(f"[CrossSystemFetch] {connector.source_id}: ERROR {str(e)[:80]}", flush=True)
-                return []
+                log.warning("CrossSystem error",
+                    source=connector.source_id, error=str(e))
+                return connector.source_id, []
 
-        search_results = await asyncio.gather(*[safe_search(c) for c in other_connectors])
+        gathered = await asyncio.gather(*[search_one(c) for c in targets])
 
         candidates = []
-        for batch in search_results:
-            if batch:
-                candidates.extend(batch)
+        sources_queried = []
+        for source_id, tickets in gathered:
+            sources_queried.append(source_id)
+            for t in tickets:
+                candidates.append(dataclasses.asdict(t))
 
-        print(f"[CrossSystemFetch] Total candidates: {len(candidates)}", flush=True)
+        log.info("CrossSystem candidates", total=len(candidates))
 
-        if not candidates:
-            context["related_tickets"] = []
-            context["sources_queried"] = sources_queried
-            return context
+        # Tier 2 fallback: if 0 candidates, try broader query
+        if not candidates and primary:
+            title = primary.get("title", "")
+            component = primary.get("component", "") or ""
+            # Extract just the first meaningful word from title
+            words = [w for w in title.split()
+                     if len(w) > 5
+                     and w.lower() not in {
+                         "cannot", "failed", "unable", "invalid",
+                         "exception", "error", "failure", "issue"}]
+            fallback_term = words[0] if words else component
 
-        # Step C: LLM scores candidates
-        scored = await self._score_candidates(groq_client, model, primary_ticket, candidates)
-        print(f"[CrossSystemFetch] Scored: {len(scored)}", flush=True)
+            if fallback_term:
+                fallback_queries = {
+                    "jira_query": fallback_term,
+                    "github_query": fallback_term,
+                    "bugzilla_query": fallback_term,
+                }
+                log.info("CrossSystem Tier2 fallback",
+                         term=fallback_term)
 
-        # Step D: Filter below 0.25, sort descending
-        filtered = [s for s in scored if s.get("similarity_score", 0) >= 0.25]
+                async def search_fallback(connector):
+                    ctype = type(connector).__name__.lower()
+                    if "jira" in ctype:
+                        q = fallback_queries["jira_query"]
+                    elif "github" in ctype:
+                        q = fallback_queries["github_query"]
+                    else:
+                        q = fallback_queries["bugzilla_query"]
+                    try:
+                        r = await asyncio.wait_for(
+                            connector.search(q, max_results=8),
+                            timeout=12.0)
+                        return connector.source_id, r
+                    except Exception:
+                        return connector.source_id, []
 
-        # If LLM scoring returned nothing, try keyword-based simple scoring
-        if not filtered and candidates:
-            try:
-                simple_scored = await self._simple_score(candidates, primary_ticket)
-                filtered = [s for s in simple_scored if s.get("similarity_score", 0) >= 0.25]
-            except Exception as e:
-                print(f"[CrossSystemFetch] Simple scoring failed: {e}", flush=True)
+                fb_gathered = await asyncio.gather(
+                    *[search_fallback(c) for c in targets])
+                for sid, tickets in fb_gathered:
+                    for t in tickets:
+                        candidates.append(dataclasses.asdict(t))
 
-        filtered.sort(key=lambda x: x.get("similarity_score", 0), reverse=True)
-        print(f"[CrossSystemFetch] Final related tickets: {len(filtered[:8])}", flush=True)
+        # Add co-references from ContextFetchAgent as
+        # deterministic links (score = 1.0, bypass threshold)
+        co_refs = context.get("co_references") or []
+        direct_hits = []
+        if co_refs:
+            all_enabled = await ConnectorRegistry.get_all_enabled()
+            for ref in co_refs[:5]:
+                for c in all_enabled:
+                    if (c.source_id != primary_source
+                            and c.system_type not in
+                            {"confluence", "customer_portal"}):
+                        try:
+                            t = await asyncio.wait_for(
+                                c.get(ref["raw_id"]),
+                                timeout=8.0)
+                            if t:
+                                td = dataclasses.asdict(t)
+                                td["similarity_score"] = 1.0
+                                td["similarity_label"] = "Identical"
+                                td["similarity_reason"] = (
+                                    "Explicit cross-reference "
+                                    "found in bug text")
+                                td["similarity_matching_fields"] = [
+                                    "direct_reference"]
+                                direct_hits.append(td)
+                                log.info(
+                                    "CrossSystem direct hit",
+                                    ref=ref["raw_id"],
+                                    source=c.source_id)
+                                break
+                        except Exception:
+                            pass
 
-        context["related_tickets"] = filtered[:8]
+        # Direct hits bypass scoring (already score 1.0)
+        scored = direct_hits + await self._batch_score(
+            primary, candidates, groq_api_key, groq_model)
+
+        # Deduplicate by ticket_id
+        seen_ids = set()
+        deduped = []
+        for item in scored:
+            tid = item.get("ticket_id", "")
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                deduped.append(item)
+        scored = deduped
+
+        log.info("CrossSystem scored", results=len(scored))
+
+        context["related_tickets"] = scored
         context["sources_queried"] = sources_queried
         return context
 
-    async def _simple_score(self, candidates, primary):
-        primary_keywords = primary.get("keywords", [])
-        primary_title_words = set(primary.get("title", "").lower().split())
-        result = []
-        for c in candidates:
-            try:
-                cd = dataclasses.asdict(c) if hasattr(c, '__dataclass_fields__') else c
-                candidate_title = cd.get("title", "").lower()
-                candidate_desc = (cd.get("description") or "").lower()
+    async def _generate_platform_queries(
+        self, primary: dict, api_key: str, model: str
+    ) -> dict:
+        title = primary.get("title", "")
+        component = primary.get("component", "") or ""
+        error_excerpt = (primary.get("error_excerpt") or "")[:400]
+        description = (primary.get("description") or "")[:300]
 
-                keyword_hits = sum(
-                    1 for kw in primary_keywords
-                    if kw.lower() in candidate_title or kw.lower() in candidate_desc
-                )
-                title_word_hits = len(primary_title_words & set(candidate_title.split()))
-                score = min(0.9, (keyword_hits * 0.15) + (title_word_hits * 0.10))
+        fallback = self._deterministic_fallback(title, component)
 
-                if score >= 0.25:
-                    label = "Good Match" if score >= 0.60 else "Fair Match" if score >= 0.40 else "Possible Match"
-                    result.append({
-                        **cd,
-                        "similarity_score": round(score, 2),
-                        "similarity_label": label,
-                        "similarity_reason": f"Keyword overlap: {keyword_hits} matching terms found",
-                        "similarity_matching_fields": ["title", "description"],
-                    })
-            except Exception:
-                pass
-        result.sort(key=lambda x: x.get("similarity_score", 0), reverse=True)
-        return result[:5]
+        if not api_key:
+            return fallback
 
-    async def _generate_query(self, client, model, ticket, keywords):
-        title = ticket.get("title", "")
-        description = (ticket.get("description") or "")[:300]
-        component = ticket.get("component") or ""
-        error_excerpt = (ticket.get("error_excerpt") or "")[:200]
+        prompt = f"""You are an expert systems engineer extracting
+search terms from a bug report to find duplicate issues.
 
-        prompt = f"""Generate a 3-5 keyword search query for finding related bugs in JIRA and Bugzilla.
+Strict rules:
+1. Strip ALL line numbers (use 'StorageController' not
+   'StorageController.java:142')
+2. Strip ALL hex addresses, thread IDs, timestamps, container IDs
+3. Focus ONLY on: Core Class Name, Exception Type, Component Name
+4. Maximum 2 words per query — be broad not specific
+5. Bad example: "NullPointerException StorageController.java:142
+   concurrent VM"
+6. Good example: "StorageController NullPointerException"
 
-Bug: {title}
+Bug:
+Title: {title}
 Component: {component}
-Keywords already extracted: {', '.join(keywords[:5])}
-Error/Description snippet: {error_excerpt or description[:150]}
+Error: {error_excerpt[:200]}
 
-Rules:
-- Use specific technical terms that appear in the bug title/description
-- These exact words should appear in related bug titles
-- 3-5 keywords maximum
-- No generic words: error, bug, issue, fail, crash, fix, problem
-
-Examples:
-"Optimizer failure: NormalizeCTEIds brakes CTE references for queries with nested CTEs"
-→ NormalizeCTEIds CTE InlineCTE optimizer
-
-"PySpark DataFrame methods behind is_remote_only() statically evaluate to Union"
-→ is_remote_only DataFrame static Union
-
-"DSv2 streaming doesn't support SupportsMetadataColumns"
-→ SupportsMetadataColumns DSv2 streaming metadata
-
-Return ONLY the keywords separated by spaces. Nothing else."""
-
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=25,
-                temperature=0.0,
-            )
-            query = response.choices[0].message.content.strip().strip('"\'').split('\n')[0]
-            return query if query else " ".join(keywords[:3])
-        except Exception as e:
-            print(f"[CrossSystemFetch] Query generation failed: {e}", flush=True)
-            return " ".join(keywords[:4]) if keywords else title[:50]
-
-    async def _score_candidates(self, client, model, primary, candidates):
-        primary_text = f"""PRIMARY BUG:
-Title: {primary.get('title', '')}
-Component: {primary.get('component', '') or 'unknown'}
-Description: {(primary.get('description') or '')[:300]}
-Error: {(primary.get('error_excerpt') or '')[:200]}
-Keywords: {', '.join(primary.get('keywords', [])[:8])}
-Severity: {primary.get('severity', '') or 'unknown'}"""
-
-        candidates_text = ""
-        capped = candidates[:8]
-        for i, c in enumerate(capped):
-            try:
-                cd = dataclasses.asdict(c) if hasattr(c, '__dataclass_fields__') else (c if isinstance(c, dict) else {})
-                candidates_text += f"""
-CANDIDATE {i+1} (id={cd.get('ticket_id','?')}, source={cd.get('source_id','?')}):
-  Title: {cd.get('title','')}
-  Component: {cd.get('component','') or 'unknown'}
-  Description: {(cd.get('description') or '')[:150]}
-  Severity: {cd.get('severity','') or 'unknown'}
-  Status: {cd.get('status','')}"""
-            except Exception:
-                candidates_text += f"\nCANDIDATE {i+1}: (parse error)"
-
-        prompt = f"""{primary_text}
-{candidates_text}
-
-Score each candidate's similarity to the primary bug (0.0 to 1.0).
-Consider: same error type, same component, same root cause, similar description.
-
-Return a JSON object with this exact format:
+Output JSON only:
 {{
-  "scores": [
-    {{
-      "ticket_id": "exact id from candidate",
-      "similarity_score": 0.85,
-      "similarity_label": "Good Match",
-      "similarity_reason": "Same component and error type",
-      "similarity_matching_fields": ["title", "component"]
-    }}
-  ]
-}}
-
-Labels: >=0.75 Excellent Match, >=0.50 Good Match, >=0.30 Fair Match, <0.30 Weak Match
-Return valid JSON only."""
+  "jira_query": "1-2 technical terms",
+  "github_query": "1-2 technical terms",
+  "bugzilla_query": "1-2 technical terms"
+}}"""
 
         try:
-            response = await client.chat.completions.create(
+            client = AsyncGroq(api_key=api_key)
+            resp = await client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1000,
                 temperature=0.0,
                 response_format={"type": "json_object"},
+                max_tokens=100,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = resp.choices[0].message.content or "{}"
             parsed = json.loads(raw)
-            scores_list = parsed.get("scores", [])
 
-            result = []
-            for entry in scores_list:
-                ticket_id = entry.get("ticket_id", "")
-                original = None
-                for c in capped:
-                    try:
-                        cid = c.ticket_id if hasattr(c, 'ticket_id') else c.get('ticket_id', '')
-                        if str(cid) == str(ticket_id):
-                            original = dataclasses.asdict(c) if hasattr(c, '__dataclass_fields__') else c
-                            break
-                    except Exception:
-                        pass
-                if original:
-                    result.append({
-                        **original,
-                        "similarity_score": entry.get("similarity_score", 0),
-                        "similarity_label": entry.get("similarity_label", "Fair Match"),
-                        "similarity_reason": entry.get("similarity_reason", ""),
-                        "similarity_matching_fields": entry.get("similarity_matching_fields", []),
-                    })
+            result = {
+                "jira_query": str(parsed.get("jira_query", "")).strip()[:50],
+                "github_query": str(parsed.get("github_query", "")).strip()[:50],
+                "bugzilla_query": str(parsed.get("bugzilla_query", "")).strip()[:50],
+            }
+
+            # Validate — if any query is empty or too generic, use fallback
+            generic = {"bug", "issue", "error", "fix", "failure", "problem",
+                       "exception", "crash", "null", ""}
+            for key, val in result.items():
+                first_word = val.split()[0].lower() if val else ""
+                if not val or first_word in generic:
+                    result[key] = fallback.get(key, "")
+
             return result
+
         except Exception as e:
-            print(f"[CrossSystemFetch] Scoring failed: {e}", flush=True)
+            log.warning("Query generation failed", error=str(e))
+            return fallback
+
+    def _deterministic_fallback(self, title: str, component: str) -> dict:
+        import re
+        # Prefer CamelCase identifiers (class/method names)
+        camel = re.findall(r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b', title)
+        if camel:
+            term = camel[0]
+        else:
+            # Fallback: longest word > 6 chars from title
+            words = [w for w in re.findall(r'\b\w+\b', title)
+                     if len(w) > 6 and not w.lower() in
+                     {'exception', 'failure', 'problem', 'cannot', 'invalid'}]
+            term = words[0] if words else (component or title.split()[0])
+
+        return {
+            "jira_query": term[:50],
+            "github_query": term[:50],
+            "bugzilla_query": term[:50],
+        }
+
+    def _select_targets(self, all_connectors: list, primary_source_id: str) -> list:
+        excluded = {"confluence", "customer_portal"}
+        candidates = [
+            c for c in all_connectors
+            if c.source_id != primary_source_id
+            and c.system_type not in excluded
+        ]
+
+        if not candidates:
             return []
+
+        def family(sid: str) -> str:
+            s = sid.lower()
+            for p in ["apache-", "mozilla-", "microsoft-",
+                      "kubernetes-", "facebook-", "nodejs-"]:
+                s = s.replace(p, "")
+            for sx in ["-jira", "-github", "-bugzilla", "-gitlab"]:
+                s = s.replace(sx, "")
+            return s
+
+        pf = family(primary_source_id)
+        apache = {"spark", "kafka", "hadoop", "hive", "flink", "hbase",
+                  "cassandra", "airflow", "zookeeper"}
+
+        sisters = [c for c in candidates if family(c.source_id) == pf]
+        related = [c for c in candidates
+                   if family(c.source_id) in apache
+                   and family(c.source_id) != pf
+                   and c not in sisters]
+
+        seen = {c.system_type for c in sisters + related}
+        others = []
+        for c in candidates:
+            if c not in sisters and c not in related and c.system_type not in seen:
+                others.append(c)
+                seen.add(c.system_type)
+
+        return (sisters + related[:3] + others[:2])[:6]
+
+    async def _batch_score(self, primary: dict, candidates: list,
+                           api_key: str, model: str) -> list:
+        if not candidates:
+            return []
+
+        if not api_key:
+            for c in candidates:
+                c["similarity_score"] = 0.4
+                c["similarity_label"] = "Possible"
+                c["similarity_reason"] = "No AI scoring available"
+                c["similarity_matching_fields"] = []
+            return candidates
+
+        primary_str = (
+            f"Title: {primary.get('title', '')}\n"
+            f"Component: {primary.get('component', '')}\n"
+            f"Severity: {primary.get('severity', '')}\n"
+            f"Error: {(primary.get('error_excerpt') or '')[:300]}\n"
+            f"Description: {(primary.get('description') or '')[:300]}"
+        )
+
+        cands_str = ""
+        for i, c in enumerate(candidates[:12]):
+            cands_str += (
+                f"\n[{i}] id={c.get('ticket_id')} "
+                f"source={c.get('source_id')}\n"
+                f"Title: {c.get('title', '')}\n"
+                f"Component: {c.get('component', '')}\n"
+                f"Description: {(c.get('description') or '')[:200]}\n"
+            )
+
+        prompt = (
+            f"Score how related each candidate bug is to the primary bug.\n"
+            f"Focus on: same root cause, same component, same exception, "
+            f"same failing code path.\n\n"
+            f"Primary:\n{primary_str}\n\n"
+            f"Candidates:{cands_str}\n\n"
+            f"Return a JSON object with key 'results' as array. Each item:\n"
+            f"index, ticket_id, similarity_score (0.0-1.0), "
+            f"similarity_label (Identical/Very Similar/Similar/Possible/Unrelated),\n"
+            f"similarity_reason (one sentence), "
+            f"similarity_matching_fields (array).\n"
+            f"Scoring: 0.9+ same root cause, 0.7 same component+error, "
+            f"0.5 same component, 0.3 related area, 0.1 unrelated.\n"
+            f"Return JSON only."
+        )
+
+        try:
+            client = AsyncGroq(api_key=api_key)
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                max_tokens=1500,
+            )
+            raw = resp.choices[0].message.content or "{}"
+            parsed = json.loads(raw)
+
+            scores_list = (
+                parsed.get("results")
+                or parsed.get("scores")
+                or parsed.get("candidates")
+                or (parsed if isinstance(parsed, list) else [])
+            )
+
+            score_map = {}
+            for s in scores_list:
+                try:
+                    validated = CandidateScore(**s)
+                    score_map[str(validated.ticket_id)] = validated
+                except Exception:
+                    continue
+
+            for c in candidates[:12]:
+                tid = str(c.get("ticket_id", ""))
+                if tid in score_map:
+                    v = score_map[tid]
+                    c["similarity_score"] = v.similarity_score
+                    c["similarity_label"] = v.similarity_label
+                    c["similarity_reason"] = v.similarity_reason
+                    c["similarity_matching_fields"] = v.similarity_matching_fields
+                else:
+                    c["similarity_score"] = 0.25
+                    c["similarity_label"] = "Possible"
+                    c["similarity_reason"] = "Not scored"
+                    c["similarity_matching_fields"] = []
+
+        except Exception as e:
+            log.warning("Batch scoring failed", error=str(e))
+            for c in candidates:
+                c["similarity_score"] = 0.25
+                c["similarity_label"] = "Possible"
+                c["similarity_reason"] = "Scoring unavailable"
+                c["similarity_matching_fields"] = []
+
+        result = [c for c in candidates[:12]
+                  if c.get("similarity_score", 0) >= 0.50
+                  or c.get("similarity_label") == "Identical"]
+        result.sort(key=lambda x: x.get("similarity_score", 0), reverse=True)
+        return result

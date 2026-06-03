@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
@@ -108,3 +108,31 @@ class KBArticle(Base):
     component:     Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     tags:          Mapped[Optional[dict]]= mapped_column(JSONB, nullable=True)
     last_modified: Mapped[str]           = mapped_column(String(50), nullable=False)
+
+
+class SystemGroupRegistry(Base):
+    __tablename__ = "system_group_registry"
+
+    group_id:          Mapped[str]           = mapped_column(String(20), primary_key=True)
+    status:            Mapped[str]           = mapped_column(String(50), default="active")
+    priority:          Mapped[str]           = mapped_column(String(10), nullable=True)
+    title:             Mapped[str]           = mapped_column(String(500), nullable=True)
+    primary_source_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_at:        Mapped[datetime]      = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at:        Mapped[datetime]      = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BugGroupMapping(Base):
+    __tablename__ = "bug_group_mappings"
+
+    id:            Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id:      Mapped[str]           = mapped_column(String(20), nullable=False)
+    raw_ticket_id: Mapped[str]           = mapped_column(String(200), nullable=False)
+    source_id:     Mapped[str]           = mapped_column(String(100), nullable=False)
+    system_type:   Mapped[str]           = mapped_column(String(50), nullable=True)
+    created_at:    Mapped[datetime]      = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("raw_ticket_id", "source_id",
+                         name="uq_bug_group_ticket"),
+    )

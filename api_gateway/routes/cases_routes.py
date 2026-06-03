@@ -16,7 +16,7 @@ from orchestrator.db.repositories.audit_log import (
 router = APIRouter(tags=["cases"])
 
 SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "Unknown": 4}
-_BUG_SOURCE_TYPES = {"github", "jira_apache", "bugzilla"}
+_BUG_SOURCE_TYPES = {"github", "jira", "jira_apache", "bugzilla"}
 
 
 async def background_full_fetch(connector_list: list) -> None:
@@ -41,7 +41,7 @@ async def background_full_fetch(connector_list: list) -> None:
                     if len(batch) < 100:
                         break
                     await asyncio.sleep(0.5)
-            elif connector.system_type == "jira_apache":
+            elif connector.system_type in ("jira", "jira_apache"):
                 for start_at in range(0, 300, 50):
                     batch = await asyncio.wait_for(
                         connector.search("", max_results=50, start_at=start_at),
@@ -128,6 +128,81 @@ async def debug_sources():
     }
 
 
+async def fetch_for_connector(connector):
+    excluded_types = {"confluence", "customer_portal"}
+    if connector.system_type in excluded_types:
+        return connector.source_id, [], False
+
+    cached = await get_cached_buglist(connector.source_id, "open", "")
+    if cached is not None:
+        print(f"[BugList] {connector.source_id}: {len(cached)} bugs (cache hit)")
+        return connector.source_id, cached, True
+
+    connector_class = type(connector).__name__.lower()
+    tickets = []
+
+    try:
+        if "jira" in connector_class:
+            for start_at in [0, 100, 200]:
+                try:
+                    batch = await asyncio.wait_for(
+                        connector.search("", max_results=100, start_at=start_at),
+                        timeout=20.0
+                    )
+                    if not batch:
+                        break
+                    tickets.extend(batch)
+                    if len(batch) < 100:
+                        break
+                except (asyncio.TimeoutError, Exception) as e:
+                    print(f"[BugList] {connector.source_id} page failed at start_at={start_at}: {e}")
+                    break
+
+        elif "github" in connector_class:
+            for page_num in [1, 2, 3]:
+                try:
+                    batch = await asyncio.wait_for(
+                        connector.search("", max_results=100, page=page_num),
+                        timeout=15.0
+                    )
+                    if not batch:
+                        break
+                    tickets.extend(batch)
+                    if len(batch) < 100:
+                        break
+                except (asyncio.TimeoutError, Exception) as e:
+                    print(f"[BugList] {connector.source_id} page {page_num} failed: {e}")
+                    break
+
+        elif "bugzilla" in connector_class:
+            try:
+                tickets = await asyncio.wait_for(
+                    connector.search("", max_results=300),
+                    timeout=20.0
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                print(f"[BugList] {connector.source_id} failed: {e}")
+                tickets = []
+
+        else:
+            try:
+                tickets = await asyncio.wait_for(
+                    connector.search("", max_results=50),
+                    timeout=10.0
+                )
+            except Exception:
+                tickets = []
+
+    except Exception as e:
+        print(f"[BugList] {connector.source_id} unexpected error: {e}")
+        return connector.source_id, [], False
+
+    data = [dataclasses.asdict(t) for t in tickets]
+    await cache_buglist(connector.source_id, "open", "", data, ttl=300)
+    print(f"[BugList] {connector.source_id}: {len(data)} bugs fetched and cached")
+    return connector.source_id, data, False
+
+
 @router.get("/bugs")
 async def get_bugs(
     page: int = Query(1, ge=1),
@@ -150,66 +225,7 @@ async def get_bugs(
             "message": "No connectors configured",
         }
 
-    async def fetch_one(connector):
-        try:
-            cached = await get_cached_buglist(connector.source_id, "open", "")
-            if cached is not None:
-                return connector.source_id, cached, True
-
-            tickets = []
-            cls_name = type(connector).__name__
-            src_id = connector.source_id.lower()
-
-            is_github = "Github" in cls_name or "gh" in src_id or "github" in src_id
-            is_jira = "Jira" in cls_name or "jira" in src_id
-            is_bugzilla = "Bugzilla" in cls_name or "bugzilla" in src_id
-
-            try:
-                if is_github:
-                    for pg in range(1, 4):  # up to 3 pages, cap at 300
-                        batch = await asyncio.wait_for(
-                            connector.search("", max_results=100, page=pg),
-                            timeout=15.0,
-                        )
-                        if not batch:
-                            break
-                        tickets.extend(batch)
-                        if len(batch) < 100 or len(tickets) >= 300:
-                            break
-                    tickets = tickets[:300]
-                elif is_jira:
-                    for start_at in range(0, 500, 100):  # up to 5 batches, cap at 500
-                        batch = await asyncio.wait_for(
-                            connector.search("", max_results=100, start_at=start_at),
-                            timeout=15.0,
-                        )
-                        if not batch:
-                            break
-                        tickets.extend(batch)
-                        if len(batch) < 100 or len(tickets) >= 500:
-                            break
-                    tickets = tickets[:500]
-                elif is_bugzilla:
-                    tickets = list(await asyncio.wait_for(
-                        connector.search("", max_results=300),
-                        timeout=15.0,
-                    ) or [])
-                else:
-                    tickets = list(await asyncio.wait_for(
-                        connector.search("", max_results=50),
-                        timeout=15.0,
-                    ) or [])
-            except asyncio.TimeoutError:
-                print(f"[BugList] {connector.source_id} timed out, returning {len(tickets)} bugs fetched so far", flush=True)
-
-            data = [dataclasses.asdict(t) for t in tickets]
-            await cache_buglist(connector.source_id, "open", "", data, ttl=120)
-            return connector.source_id, data, False
-        except Exception as e:
-            print(f"[BugList] {connector.source_id} failed: {type(e).__name__}: {str(e)[:100]}", flush=True)
-            return connector.source_id, [], False
-
-    tasks = {asyncio.create_task(fetch_one(c)): c.source_id for c in connectors}
+    tasks = {asyncio.create_task(fetch_for_connector(c)): c.source_id for c in connectors}
     done, pending = await asyncio.wait(tasks.keys(), timeout=25.0)
 
     for task in pending:
@@ -227,15 +243,42 @@ async def get_bugs(
             pass
 
     if search:
-        sl = search.lower().strip()
-        all_bugs = [
-            b for b in all_bugs
-            if sl in str(b.get("ticket_id", "")).lower()
-            or sl in str(b.get("title", "")).lower()
-            or sl in str(b.get("source_id", "")).lower()
-            or str(b.get("ticket_id", "")).lower().endswith(sl)
-            or str(b.get("ticket_id", "")).lower().startswith(sl)
-        ]
+        # Query normalization
+        sl = search.strip().lower()
+
+        def matches(b: dict) -> bool:
+            # 1. Ticket ID
+            if sl in (b.get("ticket_id") or "").lower():
+                return True
+            # 2. Title
+            if sl in (b.get("title") or "").lower():
+                return True
+            # 3. Component
+            if sl in (b.get("component") or "").lower():
+                return True
+            # 4. Source ID
+            if sl in (b.get("source_id") or "").lower():
+                return True
+            # 5. System type
+            if sl in (b.get("system_type") or "").lower():
+                return True
+            # 6. Severity
+            if sl in (b.get("severity") or "").lower():
+                return True
+            # 7. Status
+            if sl in (b.get("status") or "").lower():
+                return True
+            # 8. Description — first 200 chars only (performance bounded)
+            desc_prefix = (b.get("description") or "")[:200].lower()
+            if sl in desc_prefix:
+                return True
+            # 9. Labels array
+            for label in (b.get("labels") or []):
+                if sl in str(label).lower():
+                    return True
+            return False
+
+        all_bugs = [b for b in all_bugs if matches(b)]
     if severity:
         all_bugs = [b for b in all_bugs if b.get("severity", "") == severity]
     if source:
@@ -335,74 +378,90 @@ async def get_bug_status(bug_id: str, user: User = Depends(get_current_user)):
         }
 
     summary = last_triage.summary or {}
-    last_severity = summary.get("severity") or summary.get("unified_severity")
-    last_status = summary.get("status", "")
-    last_updated_at = summary.get("updated_at", "")
-    last_confidence = summary.get("confidence", 0)
     last_triaged_at = last_triage.created_at.isoformat() if last_triage.created_at else None
+    ticket_updated_at = summary.get("updated_at", "")
+    last_severity = summary.get("severity") or summary.get("unified_severity", "")
+    last_status = summary.get("status", "")
+    last_confidence = summary.get("confidence", 0)
 
-    changes = []
-    needs_retriage = False
-    connector = None
-
-    try:
+    connector = await ConnectorRegistry.get_connector(last_triage.source_id or "")
+    if not connector:
         connectors = await ConnectorRegistry.get_all_enabled()
-        source_id = last_triage.source_id or ""
+        for c in connectors:
+            if c.ticket_prefix and bug_id.upper().startswith(c.ticket_prefix.upper()):
+                connector = c
+                break
 
-        if source_id:
-            for c in connectors:
-                if c.source_id == source_id:
-                    connector = c
-                    break
+    if not connector:
+        return {
+            "is_new": False,
+            "last_triaged_at": last_triaged_at,
+            "last_severity": last_severity,
+            "last_confidence": last_confidence,
+            "changes": [],
+            "needs_retriage": False,
+        }
 
-        if not connector:
-            for c in connectors:
-                if c.system_type in _BUG_SOURCE_TYPES and bug_id.upper().startswith(c.ticket_prefix.upper()):
-                    connector = c
-                    break
+    live = await connector.get_lightweight(bug_id)
 
-        if connector:
-            current = await asyncio.wait_for(connector.get(bug_id), timeout=8.0)
-            if current:
-                if current.updated_at and last_updated_at:
-                    if str(current.updated_at) > str(last_updated_at):
-                        changes.append("Bug updated since last triage")
-                        needs_retriage = True
+    if not live:
+        return {
+            "is_new": False,
+            "last_triaged_at": last_triaged_at,
+            "last_severity": last_severity,
+            "last_confidence": last_confidence,
+            "changes": [],
+            "needs_retriage": False,
+        }
 
-                current_sev = current.severity or "Unknown"
-                if last_severity and current_sev != last_severity:
-                    changes.append(f"Severity changed: {last_severity} → {current_sev}")
-                    needs_retriage = True
+    no_change = (
+        live.get("updated_at", "") <= ticket_updated_at
+        and live.get("severity") == last_severity
+        and live.get("status") == last_status
+    )
 
-                if last_status and current.status != last_status:
-                    changes.append(f"Status changed: {last_status} → {current.status}")
-                    needs_retriage = True
+    if no_change:
+        return {
+            "is_new": False,
+            "last_triaged_at": last_triaged_at,
+            "last_severity": last_severity,
+            "last_confidence": last_confidence,
+            "changes": [],
+            "needs_retriage": False,
+        }
+
+    changelog = []
+    try:
+        changelog = await connector.get_changelog(bug_id, since=ticket_updated_at)
     except Exception:
-        changes.append("Could not fetch current state from external system")
+        pass
 
-    # Enrich with changelog events when changes detected
-    if needs_retriage and connector:
-        try:
-            since_str = last_triage.created_at.isoformat() if last_triage.created_at else ""
-            changelog = await asyncio.wait_for(
-                connector.get_changelog(bug_id, since=since_str),
-                timeout=8.0,
-            )
-            for event in changelog[:5]:
-                desc_str = f"{event.field}: {event.old_value} → {event.new_value}" if event.old_value or event.new_value else event.field
-                if desc_str and desc_str not in changes:
-                    changes.append(desc_str)
-        except Exception:
-            pass
+    relevant_fields = {"priority", "status", "severity", "assignee", "resolution"}
+    changes = [
+        {
+            "field": e.field,
+            "from": e.old_value,
+            "to": e.new_value,
+            "changed_at": e.changed_at,
+            "changed_by": e.changed_by,
+        }
+        for e in changelog
+        if e.field.lower() in relevant_fields
+    ]
+
+    if not changes:
+        if live.get("severity") != last_severity and last_severity:
+            changes.append({"field": "severity", "from": last_severity, "to": live.get("severity"), "changed_at": live.get("updated_at"), "changed_by": ""})
+        if live.get("status") != last_status and last_status:
+            changes.append({"field": "status", "from": last_status, "to": live.get("status"), "changed_at": live.get("updated_at"), "changed_by": ""})
 
     return {
         "is_new": False,
-        "needs_retriage": needs_retriage,
-        "changes": changes,
         "last_triaged_at": last_triaged_at,
         "last_severity": last_severity,
         "last_confidence": last_confidence,
-        "case_id": last_triage.case_id or "",
+        "changes": changes,
+        "needs_retriage": True,
     }
 
 

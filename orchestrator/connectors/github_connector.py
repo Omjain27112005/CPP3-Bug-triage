@@ -119,6 +119,83 @@ class GithubConnector(BaseConnector):
             return ticket.linked_items
         return []
 
+    async def get_lightweight(self, ticket_id: str) -> dict:
+        url = f"{self.base_url}/repos/{self._repo()}/issues/{ticket_id}"
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(url, headers=self._headers())
+                if resp.status_code != 200:
+                    return {}
+                data = resp.json()
+                labels = [lbl.get("name", "") for lbl in data.get("labels", [])]
+                severity = "Unknown"
+                for lbl in labels:
+                    if lbl.lower() in SEVERITY_LABEL_MAP:
+                        severity = SEVERITY_LABEL_MAP[lbl.lower()]
+                        break
+                return {
+                    "updated_at": data.get("updated_at", ""),
+                    "severity": severity,
+                    "status": "Open" if data.get("state") == "open" else "Closed",
+                }
+        except Exception:
+            return {}
+
+    def extract_links(self, raw_payload: dict) -> list[dict]:
+        import re
+        links = []
+        body = raw_payload.get("body") or ""
+        repo = self._repo()  # e.g. "apache/spark"
+
+        # 1. External URLs in body (JIRA, Bugzilla)
+        for url in re.findall(
+                r'https?://[^\s<>"]+', body):
+            # JIRA issue URL pattern
+            if "issues.apache.org" in url or "jira." in url:
+                m = re.search(r'/browse/([A-Z]{2,10}-\d+)', url)
+                if m:
+                    links.append({
+                        "raw_id": m.group(1),
+                        "source": "JIRA",
+                        "relationship": "Linked Reference",
+                        "url": url,
+                    })
+            # Bugzilla URL pattern
+            elif "bugzilla" in url and "id=" in url:
+                bz_id = url.split("id=")[-1].split("&")[0]
+                if bz_id.isdigit():
+                    links.append({
+                        "raw_id": bz_id,
+                        "source": "Bugzilla",
+                        "relationship": "See Also",
+                        "url": url,
+                    })
+
+        # 2. Internal issue/PR references: "Closes #22378",
+        #    "Fixes #1234", "Related to #5678", "#9012"
+        for match in re.finditer(
+                r'(?:Closes?|Fixes?|Resolves?|Related\s+to'
+                r'|See\s+also|dup\s+of|duplicate\s+of)?\s*'
+                r'#(\d{3,6})\b',
+                body, re.IGNORECASE):
+            ref_id = match.group(1)
+            issue_num = str(raw_payload.get("number", ""))
+            if ref_id != issue_num:
+                links.append({
+                    "raw_id": ref_id,
+                    "source": "GitHub",
+                    "relationship": "Mentioned Issue/PR",
+                })
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for l in links:
+            if l["raw_id"] not in seen:
+                seen.add(l["raw_id"])
+                unique.append(l)
+        return unique
+
     async def get_changelog(self, ticket_id: str, since: str = "") -> list[ChangeEvent]:
         url = f"{self.base_url}/repos/{self._repo()}/issues/{ticket_id}/events"
         try:

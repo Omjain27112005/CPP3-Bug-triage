@@ -9,7 +9,7 @@ from .db.repositories.pipeline_context import (
     update_pipeline_step, delete_pipeline_context, get_steps_to_run,
 )
 from .db.repositories.audit_log import insert_audit_entry
-from .redis_client import get_redis, publish_panel_update, cache_case_result
+from .redis_client import get_redis, cache_case_result
 
 log = structlog.get_logger()
 
@@ -97,12 +97,18 @@ class TaskOrchestrator:
         total_ms = int((time.monotonic() - start_time) * 1000)
         synthesis = context.get("synthesis") or {}
 
+        # Publish pipeline_complete IMMEDIATELY — before DB writes
+        # so WebSocket receives it before it can disconnect
+        await self._publish_complete(case_id, synthesis, total_ms)
+        log.info("Pipeline complete", case_id=case_id, duration_ms=total_ms)
+
+        # DB writes happen after WebSocket is notified
         await cache_case_result(case_id, {
             "case_id": case_id,
             "bug_id": bug_id,
             "source_id": source_id,
             "context": context,
-        })
+        }, ttl=86400)
 
         async with AsyncSessionLocal() as db:
             await insert_audit_entry(db, {
@@ -115,17 +121,19 @@ class TaskOrchestrator:
                 "summary": {
                     "severity": synthesis.get("unified_severity"),
                     "confidence": synthesis.get("confidence"),
-                    "root_cause": synthesis.get("root_cause", "")[:200],
+                    "root_cause": synthesis.get("root_cause", "")[:500],
+                    "recommended_actions": synthesis.get("recommended_actions", [])[:3],
+                    "engineer_summary": synthesis.get("engineer_summary", "")[:500],
+                    "status_summary": synthesis.get("status_summary", ""),
                     "updated_at": (context.get("primary_ticket") or {}).get("updated_at", ""),
                     "status": (context.get("primary_ticket") or {}).get("status", ""),
+                    "used_fallback": synthesis.get("used_fallback", False),
+                    "group_id": context.get("group_id"),
                 },
-                "systems_queried": context.get("sources_queried") or [],
+                "systems_queried": context.get("sources_queried", []),
                 "duration_ms": total_ms,
             })
             await delete_pipeline_context(db, case_id)
-
-        await self._publish_complete(case_id, synthesis, total_ms)
-        log.info("Pipeline complete", case_id=case_id, duration_ms=total_ms)
 
     async def _checkpoint(self, case_id: str, step: str, context: dict) -> None:
         try:
@@ -135,19 +143,55 @@ class TaskOrchestrator:
         except Exception as e:
             log.warning("Checkpoint failed", step=step, error=str(e))
 
-    async def _publish_panel(self, case_id: str, panel_name: str, data: dict) -> None:
-        await publish_panel_update(case_id, panel_name, data)
-
-    async def _publish_complete(self, case_id: str, synthesis: dict, duration_ms: int) -> None:
+    async def _publish_panel(self, case_id: str,
+                              panel_name: str, data: dict) -> None:
         try:
+            from .redis_client import get_redis
+            import json
+            r = await get_redis()
+            message = json.dumps(
+                {"panel": panel_name, "data": data})
+
+            # Persist for late WebSocket connections
+            await r.setex(
+                f"panel:{case_id}:{panel_name}", 3600, message)
+            await r.rpush(f"panels:{case_id}", panel_name)
+            await r.expire(f"panels:{case_id}", 3600)
+
+            # Publish to live listeners
+            await r.publish(f"ws:{case_id}", message)
+            log.info("Panel published",
+                     case_id=case_id, panel=panel_name)
+        except Exception as e:
+            log.warning("Panel publish failed",
+                        panel=panel_name, error=str(e))
+
+    async def _publish_complete(self, case_id: str,
+                                 synthesis: dict,
+                                 duration_ms: int) -> None:
+        try:
+            from .redis_client import get_redis
+            import json
             r = await get_redis()
             message = json.dumps({
                 "type": "pipeline_complete",
                 "case_id": case_id,
                 "severity": synthesis.get("unified_severity"),
                 "confidence": synthesis.get("confidence"),
+                "group_id": synthesis.get("group_id"),
                 "duration_ms": duration_ms,
             })
+
+            # Persist for late WebSocket connections
+            await r.setex(
+                f"panel:{case_id}:pipeline_complete",
+                3600, message)
+            await r.rpush(
+                f"panels:{case_id}", "pipeline_complete")
+            await r.expire(f"panels:{case_id}", 3600)
+
+            # Publish to live listeners
             await r.publish(f"ws:{case_id}", message)
+
         except Exception as e:
             log.warning("publish_complete failed", error=str(e))
